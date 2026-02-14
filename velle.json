@@ -1,0 +1,6 @@
+{
+  "turn_limit": 20,
+  "cooldown_ms": 1000,
+  "budget_usd": 5.00,
+  "audit_mode": "both"
+}

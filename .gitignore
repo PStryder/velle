@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Audit logs
+velle_audit.jsonl
+
+# UV
+uv.lock
+
+# IDE
+.vscode/
+.idea/

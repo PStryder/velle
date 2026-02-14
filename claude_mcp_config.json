@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "velle": {
+      "command": "F:/HexyLab/Velle/.venv/Scripts/python",
+      "args": ["-m", "velle.server"],
+      "cwd": "F:/HexyLab/Velle",
+      "env": {}
+    }
+  }
+}
