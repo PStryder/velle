@@ -166,4 +166,4 @@ From Proto-Indo-European *wel-* ("to wish"), through Latin *velle* ("to will"), 
 
 ## License
 
-MIT
+Apache 2.0
