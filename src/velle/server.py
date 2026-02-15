@@ -34,6 +34,8 @@ _DEFAULTS = {
     "cooldown_ms": 1000,
     "budget_usd": 5.00,
     "audit_mode": "both",
+    "sidecar_enabled": False,
+    "sidecar_port": 7839,
 }
 
 
@@ -324,9 +326,23 @@ async def _handle_status(args: dict) -> list[TextContent]:
 
 async def _run():
     server = _create_server()
-    async with stdio_server() as (read_stream, write_stream):
-        logger.info("Velle MCP server starting")
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    sidecar_runner = None
+
+    if _config.get("sidecar_enabled"):
+        from velle.http_sidecar import start_sidecar
+        port = _config.get("sidecar_port", 7839)
+        try:
+            sidecar_runner = await start_sidecar(_handle_prompt, _handle_status, port)
+        except OSError as e:
+            logger.warning(f"Failed to start HTTP sidecar on port {port}: {e}")
+
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            logger.info("Velle MCP server starting")
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        if sidecar_runner:
+            await sidecar_runner.cleanup()
 
 
 def main():
