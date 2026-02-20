@@ -22,6 +22,16 @@ from velle.injector import (
     check_console,
     inject,
 )
+from velle.audit import audit_log as _audit_log_impl
+from velle.guardrails import check_budget, check_cooldown, check_turn_limit
+from velle.registry import (
+    ALLOWED,
+    BLOCKED,
+    COMMAND_REGISTRY,
+    get_command,
+    is_allowed,
+    set_status,
+)
 
 logger = logging.getLogger("velle")
 
@@ -34,6 +44,7 @@ _DEFAULTS = {
     "cooldown_ms": 1000,
     "budget_usd": 5.00,
     "audit_mode": "both",
+    "cost_per_turn": 0.15,
     "sidecar_enabled": False,
     "sidecar_port": 7839,
 }
@@ -64,6 +75,7 @@ _state = {
     "cooldown_ms": _config["cooldown_ms"],
     "budget_usd": _config["budget_usd"],
     "audit_mode": _config["audit_mode"],
+    "cost_per_turn": _config["cost_per_turn"],
     "session_start": None,
     "last_prompt_time": None,
     "prompts_log": [],
@@ -80,29 +92,7 @@ def _now_iso() -> str:
 
 def _audit_log(entry: dict):
     """Write an audit entry to local file and/or MemoryGate."""
-    entry["timestamp"] = _now_iso()
-    entry["session_start"] = _state["session_start"]
-
-    mode = _state["audit_mode"]
-
-    # Local file logging
-    if mode in ("local", "both"):
-        try:
-            with open(AUDIT_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
-        except OSError as e:
-            logger.warning(f"Failed to write audit log: {e}")
-
-    # MemoryGate logging would go here in Phase 2
-    # For now, local-only is sufficient
-
-
-def _check_cooldown() -> bool:
-    """Check if enough time has passed since the last prompt."""
-    if _state["last_prompt_time"] is None:
-        return True
-    elapsed = (datetime.now(timezone.utc) - _state["last_prompt_time"]).total_seconds() * 1000
-    return elapsed >= _state["cooldown_ms"]
+    _audit_log_impl(entry, _state, audit_path=Path(AUDIT_FILE))
 
 
 def _create_server() -> Server:
@@ -183,6 +173,81 @@ def _create_server() -> Server:
                     "properties": {},
                 },
             ),
+            Tool(
+                name="velle_query",
+                description=(
+                    "Execute a Claude Code slash command with validation. "
+                    "Looks up the command in the registry — if BLOCKED, returns "
+                    "the block reason without injecting. If ALLOWED, injects the "
+                    "command and schedules a follow_up to give the agent a turn "
+                    "to see the output."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The slash command to execute (e.g. '/compact', '/status')",
+                        },
+                        "follow_up": {
+                            "type": "string",
+                            "description": "Text to inject after the command completes. "
+                            "Defaults to a generic 'review output' prompt.",
+                            "default": "Review the output of the previous command and continue.",
+                        },
+                        "delay_ms": {
+                            "type": "integer",
+                            "description": "Delay before injecting the command (default: 500ms).",
+                            "default": 500,
+                        },
+                        "follow_up_delay_ms": {
+                            "type": "integer",
+                            "description": "Delay between command injection and follow_up (default: 3000ms).",
+                            "default": 3000,
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Why this command is being queried.",
+                        },
+                    },
+                    "required": ["command"],
+                },
+            ),
+            Tool(
+                name="velle_configure",
+                description=(
+                    "Update Velle session configuration at runtime. "
+                    "Can adjust turn limits, cooldown, budget, audit mode, "
+                    "and command registry statuses."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "turn_limit": {
+                            "type": "integer",
+                            "description": "New turn limit for the session.",
+                        },
+                        "cooldown_ms": {
+                            "type": "integer",
+                            "description": "New cooldown between prompts in milliseconds.",
+                        },
+                        "budget_usd": {
+                            "type": "number",
+                            "description": "New cost budget in USD.",
+                        },
+                        "audit_mode": {
+                            "type": "string",
+                            "enum": ["local", "memorygate", "both"],
+                            "description": "Audit logging mode.",
+                        },
+                        "set_command_status": {
+                            "type": "object",
+                            "description": "Map of command name → new status (ALLOWED/BLOCKED). "
+                            "Example: {\"/review\": \"ALLOWED\"}",
+                        },
+                    },
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -191,6 +256,10 @@ def _create_server() -> Server:
             return await _handle_prompt(arguments)
         elif name == "velle_status":
             return await _handle_status(arguments)
+        elif name == "velle_query":
+            return await _handle_query(arguments)
+        elif name == "velle_configure":
+            return await _handle_configure(arguments)
         else:
             return [TextContent(type="text", text=json.dumps({
                 "status": "error",
@@ -213,29 +282,26 @@ async def _handle_prompt(args: dict) -> list[TextContent]:
         _state["session_start"] = _now_iso()
 
     # Check turn limit
-    if _state["turn_count"] >= _state["turn_limit"]:
-        result = {
-            "status": "error",
-            "error_code": "TURN_LIMIT_REACHED",
-            "message": f"Turn limit reached ({_state['turn_limit']}). "
-            f"Use velle_configure to increase or end the autonomous session.",
-            "turn_count": _state["turn_count"],
-            "turn_limit": _state["turn_limit"],
-            "timestamp": _now_iso(),
-        }
+    ok, err = check_turn_limit(_state)
+    if not ok:
+        err["timestamp"] = _now_iso()
         _audit_log({"tool": "velle_prompt", "text": text, "reason": reason,
                      "outcome": "turn_limit_reached"})
-        return [TextContent(type="text", text=json.dumps(result))]
+        return [TextContent(type="text", text=json.dumps(err))]
+
+    # Check budget
+    ok, err = check_budget(_state, cost_per_turn=_state.get("cost_per_turn", 0.15))
+    if not ok:
+        err["timestamp"] = _now_iso()
+        _audit_log({"tool": "velle_prompt", "text": text, "reason": reason,
+                     "outcome": "budget_exceeded"})
+        return [TextContent(type="text", text=json.dumps(err))]
 
     # Check cooldown
-    if not _check_cooldown():
-        result = {
-            "status": "error",
-            "error_code": "COOLDOWN_ACTIVE",
-            "message": f"Cooldown active ({_state['cooldown_ms']}ms between prompts).",
-            "timestamp": _now_iso(),
-        }
-        return [TextContent(type="text", text=json.dumps(result))]
+    ok, err = check_cooldown(_state)
+    if not ok:
+        err["timestamp"] = _now_iso()
+        return [TextContent(type="text", text=json.dumps(err))]
 
     # Check console availability (check each time since we attach/detach per injection)
     diag = check_console()
@@ -253,7 +319,6 @@ async def _handle_prompt(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(result))]
 
     # Schedule the injection after a delay
-    # The delay ensures the agent's current response finishes before injection
     async def _delayed_inject():
         await asyncio.sleep(delay_ms / 1000.0)
         try:
@@ -262,8 +327,6 @@ async def _handle_prompt(args: dict) -> list[TextContent]:
             logger.error(f"Injection failed: {e}")
             return
 
-        # If there's a follow_up, wait for the first command to complete
-        # then inject the follow_up to start a new agent turn
         if follow_up:
             await asyncio.sleep(follow_up_delay_ms / 1000.0)
             try:
@@ -306,18 +369,120 @@ async def _handle_status(args: dict) -> list[TextContent]:
     """Handle a velle_status tool call."""
     diag = check_console()
 
+    estimated_cost = _state["turn_count"] * _state.get("cost_per_turn", 0.15)
+
     result = {
         "active": _state["session_start"] is not None,
         "turn_count": _state["turn_count"],
         "turn_limit": _state["turn_limit"],
         "cooldown_ms": _state["cooldown_ms"],
         "budget_usd": _state["budget_usd"],
+        "estimated_cost_usd": round(estimated_cost, 2),
         "audit_mode": _state["audit_mode"],
         "config_file": str(CONFIG_FILE),
         "session_start": _state["session_start"],
         "console_available": diag["available"],
         "console_diagnostics": diag,
         "recent_prompts": _state["prompts_log"][-10:],
+        "timestamp": _now_iso(),
+    }
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+async def _handle_query(args: dict) -> list[TextContent]:
+    """Handle a velle_query tool call — validated slash command execution."""
+    command = args.get("command", "")
+    follow_up = args.get("follow_up", "Review the output of the previous command and continue.")
+    delay_ms = args.get("delay_ms", 500)
+    follow_up_delay_ms = args.get("follow_up_delay_ms", 3000)
+    reason = args.get("reason", "")
+
+    # Look up command in registry
+    cmd_entry = get_command(command)
+
+    if cmd_entry is None:
+        result = {
+            "status": "error",
+            "error_code": "COMMAND_UNKNOWN",
+            "message": f"Unknown command: {command}. Not in the Velle command registry.",
+            "timestamp": _now_iso(),
+        }
+        _audit_log({"tool": "velle_query", "command": command, "reason": reason,
+                     "outcome": "command_unknown"})
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    if cmd_entry["status"] == BLOCKED:
+        result = {
+            "status": "error",
+            "error_code": "COMMAND_BLOCKED",
+            "message": f"Command {command} is BLOCKED.",
+            "block_reason": cmd_entry["block_reason"],
+            "description": cmd_entry["description"],
+            "hint": "Use velle_configure with set_command_status to change this.",
+            "timestamp": _now_iso(),
+        }
+        _audit_log({"tool": "velle_query", "command": command, "reason": reason,
+                     "outcome": "command_blocked",
+                     "block_reason": cmd_entry["block_reason"]})
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    # Command is ALLOWED — delegate to _handle_prompt
+    # This counts against turn limit
+    return await _handle_prompt({
+        "text": command,
+        "delay_ms": delay_ms,
+        "follow_up": follow_up,
+        "follow_up_delay_ms": follow_up_delay_ms,
+        "reason": reason or f"velle_query:{command}",
+    })
+
+
+async def _handle_configure(args: dict) -> list[TextContent]:
+    """Handle a velle_configure tool call — runtime config updates."""
+    changes = {}
+
+    if "turn_limit" in args:
+        _state["turn_limit"] = args["turn_limit"]
+        changes["turn_limit"] = args["turn_limit"]
+
+    if "cooldown_ms" in args:
+        _state["cooldown_ms"] = args["cooldown_ms"]
+        changes["cooldown_ms"] = args["cooldown_ms"]
+
+    if "budget_usd" in args:
+        _state["budget_usd"] = args["budget_usd"]
+        changes["budget_usd"] = args["budget_usd"]
+
+    if "audit_mode" in args:
+        if args["audit_mode"] in ("local", "memorygate", "both"):
+            _state["audit_mode"] = args["audit_mode"]
+            changes["audit_mode"] = args["audit_mode"]
+
+    if "set_command_status" in args:
+        cmd_changes = {}
+        for cmd_name, new_status in args["set_command_status"].items():
+            if new_status in (ALLOWED, BLOCKED):
+                if set_status(cmd_name, new_status):
+                    cmd_changes[cmd_name] = new_status
+                else:
+                    cmd_changes[cmd_name] = "not_found"
+            else:
+                cmd_changes[cmd_name] = f"invalid_status:{new_status}"
+        changes["command_status"] = cmd_changes
+
+    _audit_log({"tool": "velle_configure", "changes": changes, "outcome": "configured"})
+
+    result = {
+        "status": "configured",
+        "changes": changes,
+        "current_config": {
+            "turn_limit": _state["turn_limit"],
+            "turn_count": _state["turn_count"],
+            "cooldown_ms": _state["cooldown_ms"],
+            "budget_usd": _state["budget_usd"],
+            "audit_mode": _state["audit_mode"],
+        },
         "timestamp": _now_iso(),
     }
 
